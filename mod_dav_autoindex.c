@@ -22,7 +22,7 @@
  *  Author: Graham Leggett
  *
  * At it's most basic, when a GET request is made on a collection, this is
- * translated into a PROPFIND reqwuest and the response returned to the
+ * translated into a PROPFIND request and the response returned to the
  * browser. The response can be filtered with an optional XSLT transform.
  *
  * Basic configuration:
@@ -72,10 +72,9 @@ module AP_MODULE_DECLARE_DATA dav_autoindex_module;
 typedef struct
 {
     int dav_autoindex_set :1;
-    int doc_set :1;
     int stylesheet_set :1;
     int dav_autoindex;
-    apr_xml_doc *doc;
+    apr_array_header_t *properties;
     ap_expr_info_t *stylesheet;
 } dav_autoindex_config_rec;
 
@@ -102,6 +101,8 @@ static void *create_dav_autoindex_dir_config(apr_pool_t *p, char *d)
 {
     dav_autoindex_config_rec *conf = apr_pcalloc(p, sizeof(dav_autoindex_config_rec));
 
+    conf->properties = apr_array_make(p, 2, sizeof(dav_prop_name));
+
     return conf;
 }
 
@@ -115,11 +116,10 @@ static void *merge_dav_autoindex_dir_config(apr_pool_t *p, void *basev, void *ad
     new->dav_autoindex = (add->dav_autoindex_set == 0) ? base->dav_autoindex : add->dav_autoindex;
     new->dav_autoindex_set = add->dav_autoindex_set || base->dav_autoindex_set;
 
-    new->doc = (add->doc_set == 0) ? base->doc : add->doc;
-    new->doc_set = add->doc_set || base->doc_set;
-
     new->stylesheet = (add->stylesheet_set == 0) ? base->stylesheet : add->stylesheet;
     new->stylesheet_set = add->stylesheet_set || base->stylesheet_set;
+
+    new->properties = apr_array_append(p, add->properties, base->properties);
 
     return new;
 }
@@ -137,51 +137,17 @@ static const char *set_dav_autoindex(cmd_parms *cmd, void *dconf, int flag)
 static const char *add_dav_autoindex_property(cmd_parms *cmd, void *dconf, const char *namespace, const char *name)
 {
     dav_autoindex_config_rec *conf = dconf;
-    apr_xml_elem *prop, *elem;
 
-    if (!conf->doc) {
+    dav_prop_name *prop = apr_array_push(conf->properties);
 
-        apr_xml_doc *doc;
-        apr_xml_elem *propfind;
-
-        doc = apr_palloc(cmd->pool, sizeof(apr_xml_doc));
-        doc->namespaces = apr_array_make(cmd->pool, 5, sizeof(const char *));
-        apr_xml_insert_uri(doc->namespaces, DAV_XML_NAMESPACE);
-
-        propfind = doc->root = apr_pcalloc(cmd->pool, sizeof(apr_xml_elem));
-        propfind->name = "propfind";
-
-        prop = apr_pcalloc(cmd->pool, sizeof(apr_xml_elem));
-        prop->name = "prop";
-        doc->root->first_child = doc->root->last_child = prop;
-
-        conf->doc = doc;
-    }
-
-    prop = conf->doc->root->first_child;
-
-    elem = apr_pcalloc(cmd->pool, sizeof(apr_xml_elem));
     if (name) {
-        elem->name = name;
-        elem->ns = apr_xml_insert_uri(conf->doc->namespaces,
-                        namespace);
+        prop->name = name;
+        prop->ns = namespace;
     }
     else {
-        elem->name = namespace;
+        prop->name = namespace;
+        prop->ns = DAV_XML_NAMESPACE;
     }
-
-    /* set up the child/sibling links */
-    if (prop->last_child == NULL) {
-        /* no first child either */
-        prop->first_child = prop->last_child = elem;
-    }
-    else {
-        /* hook onto the end of the parent's children */
-        prop->last_child->next = elem;
-        prop->last_child = elem;
-    }
-
-    conf->doc_set = 1;
 
     return NULL;
 }
@@ -436,7 +402,7 @@ static int dav_autoindex_handle_get(request_rec *r)
     dav_error *err;
     const dav_provider *provider;
     dav_resource *resource = NULL;
-    dav_autoindex_ctx ctx = { 0 };
+    dav_autoindex_ctx ctx = { { 0 } };
     dav_response *multi_status;
     const char *etag;
     int depth = 1;
@@ -475,12 +441,52 @@ static int dav_autoindex_handle_get(request_rec *r)
     ctx.w.pool = r->pool;
     ctx.w.root = resource;
 
-    ctx.doc = conf->doc;
-    if (conf->doc) {
+    if (conf->properties->nelts) {
         ctx.propfind_type = DAV_PROPFIND_IS_PROP;
     }
     else {
         ctx.propfind_type = DAV_PROPFIND_IS_ALLPROP;
+    }
+
+    if (conf->properties->nelts) {
+        apr_xml_elem *propfind, *prop, *elem;
+        apr_xml_doc *doc;
+        int i;
+
+        ctx.doc = doc = apr_palloc(r->pool, sizeof(apr_xml_doc));
+        doc->namespaces = apr_array_make(r->pool, 5, sizeof(const char *));
+        apr_xml_insert_uri(doc->namespaces, DAV_XML_NAMESPACE);
+
+        propfind = doc->root = apr_pcalloc(r->pool, sizeof(apr_xml_elem));
+        propfind->name = "propfind";
+
+        prop = apr_pcalloc(r->pool, sizeof(apr_xml_elem));
+        prop->name = "prop";
+        doc->root->first_child = doc->root->last_child = prop;
+
+        prop = doc->root->first_child;
+
+        for (i = 0; i < conf->properties->nelts; ++i) {
+            dav_prop_name *name = &APR_ARRAY_IDX(conf->properties, i, dav_prop_name);
+
+            elem = apr_pcalloc(r->pool, sizeof(apr_xml_elem));
+
+            elem->name = name->name;
+            elem->ns = apr_xml_insert_uri(doc->namespaces,
+                            name->ns);
+
+            /* set up the child/sibling links */
+            if (prop->last_child == NULL) {
+                /* no first child either */
+                prop->first_child = prop->last_child = elem;
+            }
+            else {
+                /* hook onto the end of the parent's children */
+                prop->last_child->next = elem;
+                prop->last_child = elem;
+            }
+        }
+
     }
 
     ctx.r = r;
